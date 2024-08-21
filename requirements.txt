@@ -1,0 +1,8 @@
+accelerate
+click
+datasets
+diffusers
+prodigyopt
+torchvision
+transformers
+wandb
