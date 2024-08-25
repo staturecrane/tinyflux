@@ -1,7 +1,9 @@
 import copy
+import functools
 import logging
 import os
 import random
+import typing
 
 import click
 import diffusers
@@ -155,7 +157,7 @@ def encode_prompt(
 
 preprocess = transforms.Compose(
     [
-        transforms.Resize((512, 512)),
+        transforms.Resize((256, 256)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),
@@ -163,9 +165,22 @@ preprocess = transforms.Compose(
 )
 
 
-def collate_fn(examples):
-    pixel_values = [preprocess(example["image"]) for example in examples]
-    prompts = [example["text"][0] for example in examples]
+def collate_fn(
+    examples, image_column: str, text_column: str, instance_prompt: typing.Optional[str]
+):
+    pixel_values = [preprocess(example[image_column]) for example in examples]
+
+    if instance_prompt is None:
+        prompts = [
+            (
+                random.choice(example[text_column])
+                if isinstance(example[text_column], list)
+                else example[text_column]
+            )
+            for example in examples
+        ]
+    else:
+        prompts = [instance_prompt] * len(pixel_values)
 
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -179,7 +194,7 @@ def log_validation(
     pipeline,
     accelerator,
     pipeline_args,
-    validation_prompt="A painting of a woman looking out over the sea",
+    validation_prompt,
 ):
     logger.info(
         f"Running validation... \n Generating 4 images with prompt:"
@@ -212,14 +227,39 @@ def log_validation(
 
 
 @click.command()
-@click.option("--batch-size", type=int, default=4)
 @click.option("--output-dir", type=str, required=True)
+@click.option("--dataset-name", type=str, required=True)
+@click.option("--batch-size", type=int, default=4)
 @click.option("--num-epochs", type=int, default=10)
-@click.option("--learning-rate", type=float, default=1e-4)
-def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float):
-    train_dataset = load_dataset("AterMors/wikiart_recaption")["train"]
+@click.option("--learning-rate", type=float, default=1e-6)
+@click.option("--image-column", type=str, default="image")
+@click.option("--text-column", type=str, default="text")
+@click.option("--validation-prompt", type=str, default="an apple")
+@click.option(
+    "--instance-prompt", type=str, help="Single prompt to use for all examples"
+)
+def main(
+    output_dir: str,
+    batch_size: int,
+    num_epochs: int,
+    learning_rate: float,
+    dataset_name: str,
+    image_column: str,
+    text_column: str,
+    validation_prompt: str,
+    instance_prompt: typing.Optional[str],
+):
+    train_dataset = load_dataset(dataset_name)["train"]
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=functools.partial(
+            collate_fn,
+            image_column=image_column,
+            text_column=text_column,
+            instance_prompt=instance_prompt,
+        ),
     )
 
     vae = AutoencoderKL.from_pretrained(
@@ -227,11 +267,14 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
     )
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        "black-forest-labs/FLUX.1-schnell", subfolder="scheduler"
+        "black-forest-labs/FLUX.1-schnell",
+        subfolder="scheduler",
+        num_train_timesteps=100
     )
+
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
-    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
     text_encoder_2 = T5EncoderModel.from_pretrained("google-t5/t5-small")
     tokenizer_2 = T5TokenizerFast.from_pretrained("google-t5/t5-small")
 
@@ -241,7 +284,7 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=1,
-        mixed_precision="fp16",
+        mixed_precision="bf16",
         log_with="wandb",
         project_config=accelerator_project_config,
         kwargs_handlers=[kwargs],
@@ -274,11 +317,11 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
             "guidance_embeds": True,
             "in_channels": 64,
             "joint_attention_dim": 512,
-            "num_attention_heads": 4,
-            "num_layers": 18,
-            "num_single_layers": 18,
+            "num_attention_heads": 6,
+            "num_layers": 38,
+            "num_single_layers": 38,
             "patch_size": 1,
-            "pooled_projection_dim": 768,
+            "pooled_projection_dim": 512,
         }
     )
 
@@ -377,23 +420,14 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
     }
     params_to_optimize = [transformer_parameters_with_lr]
 
-    optimizer_class = prodigyopt.Prodigy
-
-    if learning_rate <= 0.1:
-        logger.warning(
-            "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
-        )
-
+    optimizer_class = torch.optim.AdamW
+    
     optimizer = optimizer_class(
         params_to_optimize,
         lr=learning_rate,
-        betas=(0.9, 0.99),
-        beta3=None,
-        weight_decay=0.01,
-        eps=1e-08,
-        decouple=True,
-        use_bias_correction=True,
-        safeguard_warmup=True,
+        betas=(0.9, 0.999),
+        weight_decay=1e-04,
+        eps=1e-08
     )
 
     lr_scheduler = get_scheduler(
@@ -405,6 +439,7 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
         num_cycles=1,
         power=1.0,
     )
+
 
     transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, train_dataloader, lr_scheduler
@@ -461,7 +496,7 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
                 bsz = model_input.shape[0]
 
                 u = compute_density_for_timestep_sampling(
-                    weighting_scheme="logit_normal",
+                    weighting_scheme="mode",
                     batch_size=bsz,
                     logit_mean=0.0,
                     logit_std=1.0,
@@ -489,7 +524,7 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
 
                 if transformer.config.guidance_embeds:
                     guidance = torch.tensor(
-                        [random.uniform(1.0, 20.0)], device=accelerator.device
+                        [random.uniform(1.0, 10.0)], device=accelerator.device
                     )
                     guidance = guidance.expand(model_input.shape[0])
                 else:
@@ -526,7 +561,7 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
                 weighting = compute_loss_weighting_for_sd3(
-                    weighting_scheme="logit_normal", sigmas=sigmas
+                    weighting_scheme="mode", sigmas=sigmas
                 )
 
                 # flow matching loss
@@ -560,8 +595,7 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
                     progress_bar.update(1)
                     global_step += 1
 
-                    progress_bar.set_description(f"Loss: {loss.item()}")
-                    if step % 100 == 0 and step > 0:
+                    if global_step % 100 == 0 and global_step > 0:
                         with torch.no_grad():
                             pipeline = FluxPipeline.from_pretrained(
                                 "black-forest-labs/FLUX.1-schnell",
@@ -575,15 +609,19 @@ def main(output_dir: str, batch_size: int, num_epochs: int, learning_rate: float
                             )
 
                             pipeline_args = {
-                                "prompt": "a painting of a woman looking over the sea",
-                                "width": 512,
-                                "height": 512,
-                                "num_inference_steps": 50,
+                                "prompt": validation_prompt,
+                                "width": 256,
+                                "height": 256,
                             }
                             log_validation(
                                 pipeline=pipeline,
                                 accelerator=accelerator,
                                 pipeline_args=pipeline_args,
+                                validation_prompt=(
+                                    validation_prompt
+                                    if instance_prompt is None
+                                    else instance_prompt
+                                ),
                             )
 
     accelerator.wait_for_everyone()
