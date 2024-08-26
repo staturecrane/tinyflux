@@ -300,7 +300,7 @@ def main(
             "guidance_embeds": True,
             "in_channels": 64,
             "joint_attention_dim": 768,
-            "num_attention_heads": 2,
+            "num_attention_heads": 4,
             "num_layers": 19,
             "num_single_layers": 38,
             "patch_size": 1,
