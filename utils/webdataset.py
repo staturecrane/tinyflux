@@ -31,7 +31,11 @@ def group_by_keys_nothrow(
     current_sample = None
     for filesample in data:
         assert isinstance(filesample, dict)
-        fname, value = filesample["fname"], filesample["data"]
+        try:
+            fname, value = filesample["fname"], filesample["data"]
+        except KeyError:
+            continue
+
         prefix, suffix = keys(fname)
         if prefix is None:
             continue
@@ -60,24 +64,6 @@ def tarfile_to_samples_nothrow(src, handler=wds.warn_and_continue):
     files = tar_file_expander(streams, handler=handler)
     samples = group_by_keys_nothrow(files, handler=handler)
     return samples
-
-
-def transform(image, resolution, interpolation_type: str = "bilinear"):
-    interpolation_mode = resolve_interpolation_mode(interpolation_type)
-    image = TF.resize(image, resolution, interpolation=interpolation_mode)
-
-    # get crop coordinates and crop image
-    c_top, c_left, _, _ = transforms.RandomCrop.get_params(
-        image, output_size=(resolution, resolution)
-    )
-    image = TF.crop(image, c_top, c_left, resolution, resolution)
-    image = TF.to_tensor(image)
-    image = TF.normalize(image, [0.5], [0.5])
-
-    return image
-
-
-preprocess = transforms.Compose([transforms.Resize((512, 512))])
 
 
 class Text2ImageDataset:
