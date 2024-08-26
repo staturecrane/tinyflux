@@ -6,3 +6,4 @@ prodigyopt
 torchvision
 transformers
 wandb
+webdataset

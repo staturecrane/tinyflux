@@ -7,11 +7,11 @@ import typing
 
 import click
 import diffusers
+import numpy as np
 import prodigyopt
 import torch
 import torch.utils.checkpoint
 import transformers
-import wandb
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import (
@@ -19,6 +19,7 @@ from accelerate.utils import (
     ProjectConfiguration,
     set_seed,
 )
+from braceexpand import braceexpand
 from datasets import load_dataset
 from diffusers import (
     AutoencoderKL,
@@ -26,15 +27,15 @@ from diffusers import (
     FluxPipeline,
     FluxTransformer2DModel,
 )
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import (
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3,
 )
-from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
+from diffusers.utils import make_image_grid
 from diffusers.utils.torch_utils import is_compiled_module
-from huggingface_hub import create_repo, upload_folder
-from huggingface_hub.utils import insecure_hashlib
+from huggingface_hub import get_token
 from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
@@ -45,6 +46,9 @@ from transformers import (
     T5EncoderModel,
     T5TokenizerFast,
 )
+
+import wandb
+from utils.webdataset import Text2ImageDataset
 
 logger = get_logger(__name__)
 
@@ -157,7 +161,7 @@ def encode_prompt(
 
 preprocess = transforms.Compose(
     [
-        transforms.Resize((256, 256)),
+        transforms.Resize((512, 512)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),
@@ -185,9 +189,7 @@ def collate_fn(
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    batch = {"pixel_values": pixel_values, "prompts": prompts}
-
-    return batch
+    return pixel_values, prompts
 
 
 def log_validation(
@@ -228,13 +230,19 @@ def log_validation(
 
 @click.command()
 @click.option("--output-dir", type=str, required=True)
-@click.option("--dataset-name", type=str, required=True)
+@click.option("--dataset-name", type=str)
+@click.option("--webdataset-url", type=str)
+@click.option(
+    "--webdataset-epoch-samples",
+    type=int,
+    default=1_000_000,
+    help="Maximum number of samples per epoch. Useful when your data is large and you want to randomly select a subset each epoch.",
+)
 @click.option("--batch-size", type=int, default=4)
 @click.option("--num-epochs", type=int, default=10)
 @click.option("--learning-rate", type=float, default=1e-6)
 @click.option("--image-column", type=str, default="image")
 @click.option("--text-column", type=str, default="text")
-@click.option("--validation-prompt", type=str, default="an apple")
 @click.option(
     "--instance-prompt", type=str, help="Single prompt to use for all examples"
 )
@@ -243,40 +251,68 @@ def main(
     batch_size: int,
     num_epochs: int,
     learning_rate: float,
-    dataset_name: str,
+    dataset_name: typing.Optional[str],
+    webdataset_url: typing.Optional[str],
+    webdataset_epoch_samples: int,
     image_column: str,
     text_column: str,
-    validation_prompt: str,
     instance_prompt: typing.Optional[str],
 ):
-    train_dataset = load_dataset(dataset_name)["train"]
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=functools.partial(
-            collate_fn,
-            image_column=image_column,
-            text_column=text_column,
-            instance_prompt=instance_prompt,
-        ),
-    )
+    if dataset_name is not None:
+        train_dataset = load_dataset(dataset_name)["train"]
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=functools.partial(
+                collate_fn,
+                image_column=image_column,
+                text_column=text_column,
+                instance_prompt=instance_prompt,
+            ),
+        )
+
+    if webdataset_url is not None:
+        pipe_url = f"pipe:curl -L {webdataset_url}"
+        train_dataset = Text2ImageDataset(
+            train_shards_path_or_url=pipe_url,
+            num_train_examples=webdataset_epoch_samples,
+            per_gpu_batch_size=batch_size,
+            global_batch_size=batch_size,
+            num_workers=1,
+            resolution=512,
+            shuffle_buffer_size=10000,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+        train_dataloader = train_dataset.train_dataloader
 
     vae = AutoencoderKL.from_pretrained(
         "black-forest-labs/FLUX.1-schnell", subfolder="vae"
     )
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels))
+
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         "black-forest-labs/FLUX.1-schnell",
         subfolder="scheduler",
-        num_train_timesteps=100
+        **{
+            "base_image_seq_len": 256,
+            "base_shift": 0.5,
+            "max_image_seq_len": 4096,
+            "max_shift": 1.15,
+            "num_train_timesteps": 100,
+            "shift": 3.0,
+            "use_dynamic_shifting": True,
+        },
     )
 
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
-    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-    text_encoder_2 = T5EncoderModel.from_pretrained("google-t5/t5-small")
-    tokenizer_2 = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+    text_encoder_2 = T5EncoderModel.from_pretrained("google-t5/t5-base")
+    tokenizer_2 = T5TokenizerFast.from_pretrained("google-t5/t5-base")
 
     accelerator_project_config = ProjectConfiguration(
         project_dir=output_dir, logging_dir="logs"
@@ -316,12 +352,12 @@ def main(
             "attention_head_dim": 128,
             "guidance_embeds": True,
             "in_channels": 64,
-            "joint_attention_dim": 512,
-            "num_attention_heads": 6,
-            "num_layers": 38,
-            "num_single_layers": 38,
+            "joint_attention_dim": 768,
+            "num_attention_heads": 1,
+            "num_layers": 18,
+            "num_single_layers": 18,
             "patch_size": 1,
-            "pooled_projection_dim": 512,
+            "pooled_projection_dim": 768,
         }
     )
 
@@ -421,25 +457,24 @@ def main(
     params_to_optimize = [transformer_parameters_with_lr]
 
     optimizer_class = torch.optim.AdamW
-    
+
     optimizer = optimizer_class(
         params_to_optimize,
         lr=learning_rate,
         betas=(0.9, 0.999),
         weight_decay=1e-04,
-        eps=1e-08
+        eps=1e-08,
     )
 
+    total_steps = (len(train_dataloader) * num_epochs) * accelerator.num_processes
     lr_scheduler = get_scheduler(
         "cosine",
         optimizer=optimizer,
-        num_warmup_steps=(len(train_dataloader) * num_epochs) * 0.05,
-        num_training_steps=(len(train_dataloader) * num_epochs)
-        * accelerator.num_processes,
+        num_warmup_steps=total_steps * 0.05,
+        num_training_steps=total_steps,
         num_cycles=1,
         power=1.0,
     )
-
 
     transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, train_dataloader, lr_scheduler
@@ -471,19 +506,17 @@ def main(
     global_step = 0
 
     for epoch in range(num_epochs):
-        for step, sample in enumerate(train_dataloader):
+        for step, (images, prompts) in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
             with accelerator.accumulate(models_to_accumulate):
                 model_input = vae.encode(
-                    sample["pixel_values"].to(dtype=vae.dtype)
+                    images.to(device=accelerator.device, dtype=vae.dtype)
                 ).latent_dist.sample()
 
                 model_input = (
                     model_input - vae.config.shift_factor
                 ) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
-
-                vae_scale_factor = 2 ** (len(vae.config.block_out_channels))
 
                 latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                     model_input.shape[0],
@@ -495,18 +528,27 @@ def main(
                 noise = torch.randn_like(model_input)
                 bsz = model_input.shape[0]
 
-                u = compute_density_for_timestep_sampling(
-                    weighting_scheme="mode",
-                    batch_size=bsz,
-                    logit_mean=0.0,
-                    logit_std=1.0,
-                    mode_scale=1.29,
+                # u = compute_density_for_timestep_sampling(
+                #     weighting_scheme=None,
+                #     batch_size=bsz,
+                #     logit_mean=0.0,
+                #     logit_std=1.0,
+                #     mode_scale=1.29,
+                # )
+
+                # indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                # timesteps = noise_scheduler_copy.timesteps[indices].to(
+                #     device=model_input.device
+                # )
+                timesteps = torch.tensor(
+                    [
+                        random.choice([float(i) for i in range(1, 20)])
+                        for _ in range(bsz)
+                    ]
                 )
-                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                timesteps = noise_scheduler_copy.timesteps[indices].to(
+                timesteps = noise_scheduler_copy.timesteps[timesteps.long()].to(
                     device=model_input.device
                 )
-
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(
@@ -533,7 +575,7 @@ def main(
                 prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
                     [text_encoder, text_encoder_2],
                     [tokenizer, tokenizer_2],
-                    sample["prompts"],
+                    prompts,
                     77,
                 )
 
@@ -561,7 +603,7 @@ def main(
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
                 weighting = compute_loss_weighting_for_sd3(
-                    weighting_scheme="mode", sigmas=sigmas
+                    weighting_scheme=None, sigmas=sigmas
                 )
 
                 # flow matching loss
@@ -595,34 +637,36 @@ def main(
                     progress_bar.update(1)
                     global_step += 1
 
-                    if global_step % 100 == 0 and global_step > 0:
-                        with torch.no_grad():
-                            pipeline = FluxPipeline.from_pretrained(
-                                "black-forest-labs/FLUX.1-schnell",
-                                text_encoder=accelerator.unwrap_model(text_encoder),
-                                text_encoder_2=accelerator.unwrap_model(text_encoder_2),
-                                transformer=accelerator.unwrap_model(transformer),
-                                scheduler=noise_scheduler,
-                                tokenizer=tokenizer,
-                                tokenizer_2=tokenizer_2,
-                                torch_dtype=weight_dtype,
+                    if global_step % 10 == 0:
+                        autocast_ctx = torch.autocast(accelerator.device.type)
+
+                        with autocast_ctx:
+                            with torch.no_grad():
+                                original_noised_decoded = vae.decode(
+                                    noisy_model_input, return_dict=False
+                                )[0]
+                                predicted_decoded = vae.decode(
+                                    (noisy_model_input - model_pred).detach(),
+                                    return_dict=False,
+                                )[0]
+
+                            all = torch.cat(
+                                [
+                                    original_noised_decoded[:4, :, :, :],
+                                    predicted_decoded[:4, :, :, :],
+                                ],
+                                0,
                             )
 
-                            pipeline_args = {
-                                "prompt": validation_prompt,
-                                "width": 256,
-                                "height": 256,
-                            }
-                            log_validation(
-                                pipeline=pipeline,
-                                accelerator=accelerator,
-                                pipeline_args=pipeline_args,
-                                validation_prompt=(
-                                    validation_prompt
-                                    if instance_prompt is None
-                                    else instance_prompt
-                                ),
+                            images = image_processor.postprocess(
+                                all.cpu(), output_type="pil"
                             )
+
+                            image_grid = make_image_grid(images, rows=2, cols=4)
+
+                            for tracker in accelerator.trackers:
+                                phase_name = "test"
+                                tracker.log({phase_name: [wandb.Image(image_grid)]})
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
