@@ -156,14 +156,14 @@ def encode_prompt(
     return prompt_embeds, pooled_prompt_embeds, text_ids
 
 
-def preprocess(image):
-    image = TF.resize(image, 512)
+def preprocess(image, resolution):
+    image = TF.resize(image, resolution)
 
     # get crop coordinates and crop image
     c_top, c_left, _, _ = transforms.RandomCrop.get_params(
-        image, output_size=(512, 512)
+        image, output_size=(resolution, resolution)
     )
-    image = TF.crop(image, c_top, c_left, 512, 512)
+    image = TF.crop(image, c_top, c_left, resolution, resolution)
     image = TF.to_tensor(image)
     image = TF.normalize(image, [0.5], [0.5])
 
@@ -171,9 +171,15 @@ def preprocess(image):
 
 
 def collate_fn(
-    examples, image_column: str, text_column: str, instance_prompt: typing.Optional[str]
+    examples,
+    image_column: str,
+    text_column: str,
+    resolution: int,
+    instance_prompt: typing.Optional[str] = None,
 ):
-    pixel_values = [preprocess(example[image_column]) for example in examples]
+    pixel_values = [
+        preprocess(example[image_column], resolution) for example in examples
+    ]
 
     if instance_prompt is None:
         prompts = [
@@ -240,6 +246,7 @@ def log_validation(
     help="Maximum number of samples per epoch. Useful when your data is large and you want to randomly select a subset each epoch.",
 )
 @click.option("--batch-size", type=int, default=4)
+@click.option("--resolution", type=int, default=512)
 @click.option("--num-epochs", type=int, default=10)
 @click.option("--learning-rate", type=float, default=1e-6)
 @click.option("--image-column", type=str, default="image")
@@ -258,6 +265,7 @@ def main(
     image_column: str,
     text_column: str,
     instance_prompt: typing.Optional[str],
+    resolution: int,
 ):
     vae = AutoencoderKL.from_pretrained(
         "black-forest-labs/FLUX.1-schnell", subfolder="vae"
@@ -292,7 +300,7 @@ def main(
             "guidance_embeds": True,
             "in_channels": 64,
             "joint_attention_dim": 768,
-            "num_attention_heads": 4,
+            "num_attention_heads": 2,
             "num_layers": 19,
             "num_single_layers": 38,
             "patch_size": 1,
@@ -358,6 +366,7 @@ def main(
                 collate_fn,
                 image_column=image_column,
                 text_column=text_column,
+                resolution=resolution,
                 instance_prompt=instance_prompt,
             ),
         )
