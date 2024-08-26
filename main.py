@@ -254,6 +254,7 @@ def log_validation(
 @click.option(
     "--instance-prompt", type=str, help="Single prompt to use for all examples"
 )
+@click.option("--num-train-timesteps", type=int, default=1000)
 def main(
     output_dir: str,
     batch_size: int,
@@ -266,6 +267,7 @@ def main(
     text_column: str,
     instance_prompt: typing.Optional[str],
     resolution: int,
+    num_train_timesteps: int,
 ):
     vae = AutoencoderKL.from_pretrained(
         "black-forest-labs/FLUX.1-schnell", subfolder="vae"
@@ -282,7 +284,7 @@ def main(
             "base_shift": 0.5,
             "max_image_seq_len": 4096,
             "max_shift": 1.15,
-            "num_train_timesteps": 100,
+            "num_train_timesteps": num_train_timesteps,
             "shift": 3.0,
             "use_dynamic_shifting": True,
         },
