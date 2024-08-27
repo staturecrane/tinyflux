@@ -255,6 +255,7 @@ def log_validation(
     "--instance-prompt", type=str, help="Single prompt to use for all examples"
 )
 @click.option("--num-train-timesteps", type=int, default=1000)
+@click.option("--num-attention-heads", type=int, default=4)
 def main(
     output_dir: str,
     batch_size: int,
@@ -268,6 +269,7 @@ def main(
     instance_prompt: typing.Optional[str],
     resolution: int,
     num_train_timesteps: int,
+    num_attention_heads: int,
 ):
     vae = AutoencoderKL.from_pretrained(
         "black-forest-labs/FLUX.1-schnell", subfolder="vae"
@@ -302,7 +304,7 @@ def main(
             "guidance_embeds": True,
             "in_channels": 64,
             "joint_attention_dim": 768,
-            "num_attention_heads": 4,
+            "num_attention_heads": num_attention_heads,
             "num_layers": 19,
             "num_single_layers": 38,
             "patch_size": 1,
